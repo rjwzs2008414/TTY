@@ -1,164 +1,67 @@
-#include <iostream>
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
-#include <cstring>
+#pragma once
 
-//Default settings
+#include <cstddef>
+#include <string>
+#include <vector>
 
-#define  B57600    0010001
-#define  B115200   0010002
-#define  B230400   0010003
-#define  B460800   0010004
-#define  B500000   0010005
-#define  B576000   0010006
-#define  B921600   0010007
-#define  B1000000  0010010
-#define  B1152000  0010011
-#define  B1500000  0010012
-#define  B2000000  0010013
-#define  B2500000  0010014
-#define  B3000000  0010015
-#define  B3500000  0010016
-#define  B4000000  0010017
-#define __MAX_BAUD B4000000
-
-/*
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8; // 8 数据位
-    tty.c_iflag &= ~IGNBRK;                     // 禁用 break 处理
-    tty.c_lflag = 0;                            // 非规范模式
-    tty.c_oflag = 0;                            // 禁用输出处理
-    tty.c_cflag |= (CLOCAL | CREAD);            // 启用接收
-    tty.c_cflag &= ~(PARENB | PARODD);          // 无奇偶校验
-    tty.c_cflag &= ~CSTOPB;                     // 1 个停止位
-    tty.c_cflag &= ~CRTSCTS;                    // 禁用硬件流控
-*/
-
-
+// Small cross-platform serial-port wrapper.
+//
+// The class is a transport only: it writes/reads raw bytes and never appends a
+// checksum on its own.  The RGB protocol (header + RGB + CRC-16) lives in
+// rgb_protocol.h so that both sides can use the same frame definition.
 class TTY {
-    public:
-        TTY(char * device , int IoSpeed){
-            this->fd = open(device, O_RDWR | O_NOCTTY | O_SYNC);
+public:
+    // Opens the port and configures 8N1, no flow control.
+    // Throws std::runtime_error when the port cannot be opened/configured.
+    TTY(const std::string& device, int baud);
+    ~TTY();
 
-            if (this->fd == -1) {
-                perror("Error opening serial port");
-                exit(114514);
-            }
-            if (tcgetattr(this->fd, &this->tty) != 0) {
-                perror("Error getting terminal attributes");
-                close(this->fd);
-                exit(114514);
-            }
+    TTY(const TTY&) = delete;
+    TTY& operator=(const TTY&) = delete;
+    TTY(TTY&& other) noexcept;
+    TTY& operator=(TTY&& other) noexcept;
 
-            cfsetospeed(&this->tty, IoSpeed); // 设置输入波特率
-            cfsetispeed(&this->tty, IoSpeed); // 设置输出波特率
+    bool IsOpen() const noexcept;
 
-            this->tty.c_cflag = (this->tty.c_cflag & ~CSIZE) | CS8; // 8 数据位
-            this->tty.c_iflag &= ~IGNBRK;                     // 禁用 break 处理
-            this->tty.c_lflag = 0;                            // 非规范模式
-            this->tty.c_oflag = 0;                            // 禁用输出处理
-            this->tty.c_cflag |= (CLOCAL | CREAD);            // 启用接收
-            this->tty.c_cflag &= ~(PARENB | PARODD);          // 无奇偶校验
-            this->tty.c_cflag &= ~CSTOPB;                     // 1 个停止位
-            this->tty.c_cflag &= ~CRTSCTS;                    // 禁用硬件流控
+    // Writes exactly `length` bytes.  Returns false on error.
+    bool Write(const void* data, std::size_t length);
 
-            // 提交配置
-            if (tcsetattr(this->fd, TCSANOW, &this->tty) != 0) {
-                perror("Error setting terminal attributes");
-                close(this->fd);
-                exit(114514);
-            }
-        }
-        TTY(char * device , int IoSpeed , struct termios default_tty){
-            this->fd = open(device, O_RDWR | O_NOCTTY | O_SYNC);
+    // Reads exactly `length` bytes or times out.  Returns false on timeout or
+    // error; `timeout_ms < 0` means wait forever.
+    bool Read(void* data, std::size_t length, int timeout_ms = 1000);
 
-            if (this->fd == -1) {
-                perror("Error opening serial port");
-                exit(114514);
-            }
-            if (tcgetattr(this->fd, &default_tty) != 0) {
-                perror("Error getting terminal attributes");
-                close(this->fd);
-                exit(114514);
-            }
+    // Compatibility helpers.  `count` is the number of T objects, not bytes.
+    template <typename T>
+    bool SendData(const T* data, std::size_t count) {
+        return Write(data, count * sizeof(T));
+    }
 
-            cfsetospeed(&default_tty, IoSpeed); // 设置输入波特率
-            cfsetispeed(&default_tty, IoSpeed); // 设置输出波特率
-            // 提交配置
-            if (tcsetattr(this->fd, TCSANOW, &default_tty) != 0) {
-                perror("Error setting terminal attributes");
-                close(this->fd);
-                exit(114514);
-            }
-        }
-       ~TTY(){
-            close(this->fd);
-        }
-        template <typename T>
-        bool SendData(T *data, size_t length){
-            this->crc = CalculateCrc8(data,length);
-            memcpy(data,&crc,sizeof(crc));
-            int n = write(this->fd, data, length);
-            if (n > 0) {
-                printf("CRC valid. Data send correctly.\n");
-                for (uint32_t i = 0; i < length; i++) {
-                    printf("0x%02X ", data[i]);
-                }
-            }else{
-                perror("Write Error:");
-            }
-        }
-        template <typename T>
-        bool ReceiveData(T *data, size_t length){
-            int n = read(this->fd, data, length);
-            if (n > 0) {
-                if (this->ValidateCrc8(data, length)) {
-                    printf("CRC valid. Data received correctly.\n");
-                } else {
-                    printf("CRC invalid. Data corrupted.\n");
-                }
-                for (uint32_t i = 0; i < length; i++) {
-                    printf("0x%02X ", data[i]);
-                }
-            }else{
-                perror("Read Error:");
-            }
-        }
+    bool SendData(const std::string& data) {
+        return Write(data.data(), data.size());
+    }
 
+    template <typename T>
+    bool ReceiveData(T* data, std::size_t count, int timeout_ms = 1000) {
+        return Read(data, count * sizeof(T), timeout_ms);
+    }
 
-    private:
-        int fd;
-        struct termios tty;
-        uint8_t crc;
-    protected:
-        template <typename T>
-        bool ValidateCrc8(T *data, size_t length){
-            if (length < 2) {
-                // the mini length is 2
-                return false;
-            }
+    void Close() noexcept;
 
-            size_t dataLength = length - 1; // delete the last byte
-            uint8_t calculated_crc = this->CalculateCrc8(data, dataLength); // calculate
-            uint8_t received_crc = data[dataLength]; // the crc which we received
+    const std::string& LastError() const noexcept { return error_; }
 
-            return calculated_crc == received_crc; // compare them
-        }
-                template <typename T>
-        bool CalculateCrc8(T *data, size_t length){
-            uint8_t crc = 0x00; // 初始化 CRC 值
-            uint8_t polynomial = 0x07; // 生成多项式 x^8 + x^2 + x + 1
+    // Windows: COM1..COM256 that the OS reports.
+    // Linux: /dev/ttyUSB*, /dev/ttyACM*, /dev/ttyTHS*, /dev/ttyS*.
+    static std::vector<std::string> ListPorts();
 
-            for (size_t i = 0; i < length; i++) {
-                crc ^= data[i]; // 与输入数据异或
-                for (uint8_t bit = 0; bit < 8; bit++) {
-                    if (crc & 0x80) {
-                        crc = (crc << 1) ^ polynomial; // 左移并与多项式异或
-                    } else {
-                        crc <<= 1; // 仅左移
-                    }
-                }
-            }
-            return crc;
-        }
+    static bool IsSupportedBaud(int baud) noexcept;
+
+private:
+    void SetError(const std::string& message);
+
+#ifdef _WIN32
+    void* handle_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+    std::string error_;
 };
